@@ -211,6 +211,9 @@ static ncclResult_t sendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   req.tpLocalRank = comm->topParentLocalRanks[comm->localRank];
   req.tpRank = comm->topParentRanks[myInfo->rank];
   req.tpRemoteRank = comm->topParentRanks[peerInfo->rank];
+  //  我们以client端为例，首先client端proxySerivice线程收到ncclProxyMsgSetup，
+  // 然后调用对应Transport的proxySetup，对应net Transport，即为sendProxySetup。
+  // 而sendProxySetup主要进行如下调用，调用对应netplugin的getProperties。
   NCCLCHECK(ncclProxyCallBlocking(comm, &send->proxyConn, ncclProxyMsgSetup, &req, sizeof(req), NULL, 0));
 
   if (proxyRank == myInfo->rank) {
@@ -736,10 +739,13 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
       resources->netSendComm = comms->sendComm[resources->channelId];
       if (comms->sendComm[resources->channelId]) comms->sendRefCount[resources->channelId]++;
     } else {
+      // 建联
+      // 调用到 ncclIbConnect
       ret = proxyState->ncclNet->connect(resources->netDev, &commConfig, req->handle, &resources->netSendComm, &resources->netDeviceHandle);
     }
   } else {
     // Connect to remote peer
+    // 建联
     ret = proxyState->ncclNet->connect(resources->netDev, &commConfig, req->handle, &resources->netSendComm, &resources->netDeviceHandle);
     connection->proxyAppendPtr = &connection->proxyAppend;
   }
@@ -893,6 +899,7 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
       ret = proxyState->ncclNet->accept(resources->netListenComm, &resources->netRecvComm, &resources->netDeviceHandle);
     }
   } else {
+    // 接收端的逻辑，也需要建 qp 等操作,也就是 ncclIbAccept
     // Connect to remote peer
     ret = proxyState->ncclNet->accept(resources->netListenComm, &resources->netRecvComm, &resources->netDeviceHandle);
     connection->proxyAppendPtr = &connection->proxyAppend;

@@ -672,13 +672,16 @@ ncclResult_t ncclTopoGetSystemFromXml(struct ncclXml* xml, struct ncclTopoSystem
   NCCLCHECK(ncclCalloc(topoSystem, 1));
   struct ncclTopoSystem* system = *topoSystem;
   struct ncclXmlNode* topNode;
+  // 最顶层的 system
   NCCLCHECK(xmlFindTag(xml, "system", &topNode));
   for (int s=0; s<topNode->nSubs; s++) {
     struct ncclXmlNode* node = topNode->subs[s];
+    // 下一层是 cpu numa node
     if (strcmp(node->name, "cpu") == 0) NCCLCHECK(ncclTopoAddCpu(node, *topoSystem));
   }
   for (int systemId=0; systemId<system->nHosts; systemId++) if (system->hostHashes[systemId] == localHostHash) system->systemId = systemId;
 
+  // 下面是 cpu 下面的 pci、nvlinks 等
   NCCLCHECK(ncclTopoAddNvLinks(topNode, *topoSystem, NULL, 0));
   NCCLCHECK(ncclTopoAddC2c(topNode, *topoSystem, NULL, 0));
   NCCLCHECK(ncclTopoAddPciLinks(topNode, *topoSystem, NULL, 0));
@@ -1304,12 +1307,15 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
   if (xml->maxIndex == 0) {
     // Create top tag
     struct ncclXmlNode* top;
+    // 首先通过xmlAddNode创建根节点"system"（后续使用双引号表示xml树节点），并设置根节点属性"system" ["version"] = NCCL_TOPO_XML_VERSION
     NCCLCHECKGOTO(xmlAddNode(xml, NULL, "system", &top), ret, fail);
     NCCLCHECKGOTO(xmlSetAttrInt(top, "version", NCCL_TOPO_XML_VERSION), ret, fail);
   }
 
+  // 读取这个文件，可以用于重新扫描 PCI 总线，以识别所有当前连接的设备。
   NCCLCHECKGOTO(ncclTopoRefreshBcmP2pLinks(), ret, fail);
 
+  // 加入 GDR 支持信息
   // Detect only the GPU managed by this process.  We'll get any others through XML fusion.
   char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
   NCCLCHECKGOTO(int64ToBusId(comm->peerInfo[comm->rank].busId, busId), ret, fail);
@@ -1321,6 +1327,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
     NCCLCHECKGOTO(xmlInitAttrInt(node, "gdr", comm->peerInfo[comm->rank].gdrSupport), ret, fail);
   }
 
+  // 加入网卡拓扑信息
   // Auto-detect NICs if needed. net/collnet share the same xml/graph nodes,
   // so we start with collnet so that it has precedence.
   pthread_mutex_lock(&netLock);
@@ -1342,6 +1349,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
   // Remove XML branches which don't have a node with keep="1" (typically when importing a topology)
   NCCLCHECKGOTO(ncclTopoTrimXml(xml), ret, fail);
 
+  // 拓扑融合
   // XML topo fusion.
   if (comm->MNNVL) {
     // MNNVL clique support
@@ -1349,6 +1357,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
     localRank = comm->cliqueRank;
     localRanks = comm->clique.ranks;
   } else {
+    // 位于当前节点有几个 rank
     // Intra-node fusion.  Much of the comm is not initialized yet at this point so we need to do our own calculations.
     NCCLCHECKGOTO(ncclCalloc(&localRanks, comm->nRanks), ret, fail);
     for (int i = 0; i < comm->nRanks; i++) {
@@ -1365,6 +1374,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
   NCCLCHECKGOTO(ncclTopoConvertXml(rankXml, (uintptr_t)xml->nodes, 1), ret, fail);
   // nLocalRanks can't actually be 0, or we wouldn't be running at all...
   // coverity[divide_by_zero]
+  // intra-node 每个 rank 的 info gather 起来
   NCCLCHECKGOTO(bootstrapIntraNodeAllGather(comm->bootstrap, localRanks, localRank, nLocalRanks, mem, xmlMemSize(NCCL_TOPO_XML_MAX_NODES)), ret, fail);
   if (comm->MNNVL) {
     // Ensure that we have enough room when fusing topos from multiple nodes.
@@ -1375,6 +1385,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
     // In the intra-node case there's no need to enlarge the topo xml.
     xml->maxIndex = 0;
   }
+  // fuse 成一个 tree
   for (int i = 0; i < nLocalRanks; i++) {
     struct ncclXml* peerXml = (struct ncclXml*)(mem+xmlMemSize(NCCL_TOPO_XML_MAX_NODES)*i);
     NCCLCHECKGOTO(ncclTopoConvertXml(peerXml, (uintptr_t)peerXml->nodes, 0), ret, fail);

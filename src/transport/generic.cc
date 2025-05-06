@@ -2,6 +2,10 @@
 #include "transport.h"
 #include "bootstrap.h"
 
+// 主要就是调用ncclTransportP2pConnect和ncclTransportP2pSetup，
+// 而ncclTransportP2pConnect也不是真的把P2P channel的两个rank之间连接起来，
+// 而是根据当前rank在每个channel中的prev和next，设置对应rank的mask，
+// 后续真正建立transport时根据这里的mask决定哪些rank之间需要创建，以及需要创建多少。
 ncclResult_t ncclTransportRingConnect(struct ncclComm* comm) {
   struct ringConnInfo {
     bool useNetPXN;
@@ -16,6 +20,7 @@ ncclResult_t ncclTransportRingConnect(struct ncclComm* comm) {
       struct ncclChannel* channel = comm->channels + c;
       NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, 1, &channel->ring.prev, 1, &channel->ring.next, 0), ret, fail);
     }
+    // 关键的还是ncclTransportP2pSetup这个函数，这个函数是创建transport的核心。
     NCCLCHECKGOTO(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], 0), ret, fail);
     if (ncclParamLocalRegister() || ncclParamGraphRegister()) {
       NCCLCHECK(ncclCalloc(&ringInfo, comm->nRanks));

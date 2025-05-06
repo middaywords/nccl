@@ -557,6 +557,8 @@ int checkBDFFormat(char* bdf) {
   return 1;
 }
 
+// 然后读取path下的属性，获取class（PCI设备类型），link_speed，link_width等设置到xml pciNode中，
+// ncclTopoGetStrFromSys其实就是读取path下的内核文件保存到strValue。
 ncclResult_t ncclTopoGetXmlFromSys(struct ncclXmlNode* pciNode, struct ncclXml* xml) {
   // Fill info, then parent
   const char* busId;
@@ -873,8 +875,10 @@ ncclResult_t ncclTopoGetXmlFromGpu(struct ncclXmlNode* pciNode, nvmlDevice_t nvm
 
 ncclResult_t ncclTopoFillGpu(struct ncclXml* xml, const char* busId, struct ncclXmlNode** gpuNode) {
   struct ncclXmlNode* node;
+  // 通过ncclTopoGetPciNode获取xml中的有没有创建当前卡的xml node，此时没有，所以就新建一个xml node叫做"pci"，表示当前gpu卡，设置"pci"["busid"]=busd。
   NCCLCHECK(ncclTopoGetPciNode(xml, busId, &node));
   NCCLCHECK(xmlSetAttrIfUnset(node, "class", "0x03"));
+  // 设置pciNode的各种属性，通过getPciPath获取busId对应的sysfs路径path，其实这个路径就是PCI树中根到叶结点的路径。
   NCCLCHECK(ncclTopoGetXmlFromSys(node, xml));
   nvmlDevice_t nvmlDev;
   NCCLCHECK(ncclNvmlDeviceGetHandleByPciBusId(busId, &nvmlDev));

@@ -594,6 +594,7 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
 
       if (ncclSuccess != wrap_ibv_get_device_list(&devices, &nIbDevs)) { ret = ncclInternalError; goto fail; }
 
+      // 对每个 device 都 建一个 ncclIbAsyncThread
       for (int d=0; d<nIbDevs && ncclNIbDevs<MAX_IB_DEVS; d++) {
         struct ibv_context * context;
         if (ncclSuccess != wrap_ibv_open_device(&context, devices[d]) || context == NULL) {
@@ -837,6 +838,7 @@ struct ncclIbDevInfo {
   union ibv_gid remoteGid;
 };
 
+// 建联必要信息
 // Struct containing everything needed to establish connections
 struct ncclIbConnectionMetadata {
   struct ncclIbQpInfo qpInfo[NCCL_IB_MAX_QPS];
@@ -1198,6 +1200,7 @@ ncclResult_t ncclIbConnect(int dev, ncclNetCommConfig_t* config, void* opaqueHan
   uint8_t link_layer = IBV_LINK_LAYER_UNSPECIFIED;
   *sendComm = NULL;
 
+  // 不同 stage->state 代表不同的连接阶段
   if (stage->state == ncclIbCommStateConnect)      goto ib_connect_check;
   if (stage->state == ncclIbCommStateSendDevList)  goto ib_send_dev_list;
   if (stage->state == ncclIbCommStateRecvDevList)  goto ib_recv_dev_list;
@@ -1234,12 +1237,14 @@ ib_connect_check:
   comm->base.isSend = true;
   stage->state = ncclIbCommStateSendDevList;
   stage->offset = 0;
+  // 建联所需数据
   struct ncclIbConnectionMetadata meta;
   NCCLCHECKGOTO(ncclIbMalloc((void**)&stage->buffer, sizeof(meta)), ret, fail);
   memcpy(stage->buffer, &mergedDev->vProps, sizeof(ncclNetVDeviceProps_t));
 
 // In the case of mismatched nDevs, we will make sure that both sides of a logical connection have the same number of RC qps
 ib_send_dev_list:
+  // 给 proxy progress 发消息，每个 stage state 都有这个操作
   NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer, sizeof(ncclNetVDeviceProps_t), &stage->offset));
   if (stage->offset != sizeof(ncclNetVDeviceProps_t)) return ncclSuccess;
 
@@ -1263,6 +1268,7 @@ ib_recv_dev_list:
   comm->ar = 1; // Set to 1 for logic
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     int ibDevN = comm->base.vProps.devs[i];
+    // 初始化 protected domain，创建 completion queue
     NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &comm->devs[i].base, &comm->base.stats), ret, fail);
     comm->ar = comm->ar && ncclIbDevs[ibDevN].ar; // ADAPTIVE_ROUTING - if all merged devs have it enabled
   }
@@ -1276,13 +1282,20 @@ ib_recv_dev_list:
   for (int q = 0; q < comm->base.nqps; q++) {
     ncclIbSendCommDev* commDev = comm->devs + devIndex;
     ncclIbDev* ibDev = ncclIbDevs + commDev->base.ibDevN;
+    // 创建 qp
     NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &commDev->base, IBV_ACCESS_REMOTE_WRITE, &comm->base.stats, comm->base.qps + q), ret, fail);
+    //QP初始化好之后就准备通过socket交换发送端和接收端的信息，获取port相关信息，
+    // 将port，mtu，qpn赋值给qpInfo，然后判断使用的是ib还是roce，roce里lid为0，
+    // 只能用gid进行通信，而ib可以使用lid进行通信，最后通过socket将qpInfo发送到接收端，即rank 10。
     comm->base.qps[q].devIndex = devIndex;
     meta.qpInfo[q].qpn      = comm->base.qps[q].qp->qp_num;
     meta.qpInfo[q].devIndex = comm->base.qps[q].devIndex;
 
     if (ncclParamIbEceEnable()) {
       // Query ece capabilities (enhanced connection establishment)
+      // 查询当前设备是否具有ece capabilities (enhanced connection establishment)，
+      // ECE是一种新的协商方案，用于交换有关QP能力的额外信息，然后在连接建立阶段进行协商。
+      // 它用于支持各种功能，如RoCE选择性重传和PCC。
       NCCLCHECKGOTO(wrap_ibv_query_ece(comm->base.qps[q].qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail);
     } else {
       meta.qpInfo[q].ece_supported = 0;
@@ -1300,6 +1313,10 @@ ib_recv_dev_list:
     devInfo->mtu           = ibDev->portAttr.active_mtu;
     devInfo->lid           = ibDev->portAttr.lid;
 
+    // 对于ncclSend这里是将comm->fifo注册为MR。注册MR主要有的如下3个作用：
+    // • 实现虚拟地址到物理地址的转换，为此需要建立一个MR地址转换表。
+    // • 控制 HCA 访问内存的权限，需要生成和使用本地密钥 L_Key 和远程密钥 R_Key。
+    // • 避免换页，需要锁住（Pin）数据缓存所在的内存页。
     // Prepare my fifo
     NCCLCHECKGOTO(wrap_ibv_reg_mr(&commDev->fifoMr, commDev->base.pd, comm->fifo, sizeof(struct ncclIbSendFifo)*MAX_REQUESTS*NCCL_NET_IB_MAX_RECVS, IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ), ret, fail);
     devInfo->fifoRkey = commDev->fifoMr->rkey;
@@ -1350,6 +1367,9 @@ ib_recv_dev_list:
   memcpy(stage->buffer, &meta, sizeof(meta));
 
 ib_send:
+  // 下面这一段代码主要就是调用两次ncclSocketProgress，
+  // 一次是send操作，将本rank的设备RDMA信息，包括设备名称，设备个数，qp信息等，通过struct ncclIbConnectionMetadata结构发送给对端rank；
+  // 然后在通过recv操作接收对端rank的ncclIbConnectionMetadata信息，以此来完成两端RDMA信息的互相告知。
   NCCLCHECKGOTO(ncclSocketProgress(NCCL_SOCKET_SEND, &comm->base.sock, stage->buffer, sizeof(meta), &stage->offset), ret, fail);
   if (stage->offset != sizeof(meta)) return ncclSuccess;
 
@@ -1411,7 +1431,9 @@ ib_connect:
 
     ncclIbDev* ibDev = ncclIbDevs + commDev->base.ibDevN;
     remDevInfo->mtu = std::min(remDevInfo->mtu, ibDev->portAttr.active_mtu);
+    // 设置 rtr 状态，对端信息等
     NCCLCHECKGOTO(ncclIbRtrQp(qp, &commDev->base.gidInfo, remQpInfo->qpn, remDevInfo, false, remMeta.tc, remMeta.sl), ret, fail);
+    // 设置 rts 状态，对端信息等
     NCCLCHECKGOTO(ncclIbRtsQp(qp), ret, fail);
   }
 

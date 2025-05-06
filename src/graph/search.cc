@@ -35,6 +35,9 @@ static float getTotalBw(struct ncclTopoSystem* system, struct ncclTopoNode* gpu)
   }
   return std::max(pciBw, nvlinkBw);
 }
+
+// 初始化system->maxWidth，如果是单机单卡的情况，那么maxWidth设置为LOC_WIDTH，
+// 否则就遍历每个GPU节点，查看到其他所有GPU节点或者网卡最大带宽。
 ncclResult_t ncclTopoSearchInit(struct ncclTopoSystem* system) {
   system->maxBw = 0.0;
   system->totalBw = 0.0;

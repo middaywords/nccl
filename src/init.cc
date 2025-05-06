@@ -803,6 +803,9 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   // Recompute paths after trimming
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
   // Init search
+  // nccl中channel的概念表示一个通信路径，为了更好的利用带宽和网卡，以及同一块数据可以通过多个channel并发通信，
+  // 另外后续可以看到一个channel对应了一个GPU SM，所以基于这些原因，nccl会使用多channel，
+  // 搜索的过程就是搜索出来一组channel。
   NCCLCHECKGOTO(ncclTopoSearchInit(comm->topo), ret, fail);
   // Decide on comm's CPU architecture.
   NCCLCHECKGOTO(ncclTopoComputeCommCPU(comm), ret, fail);
@@ -842,6 +845,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclTopoCompute(comm->topo, ringGraph), ret, fail);
   NCCLCHECKGOTO(ncclTopoPrintGraph(comm->topo, ringGraph), ret, fail);
 
+  // 对 treeGraph 执行初始化
+  // 使用 ncclTopoCompute 函数计算出 treeGraph 的拓扑结构
   memset(treeGraph, 0, sizeof(struct ncclTopoGraph));
   treeGraph->id = 1;
   treeGraph->pattern = NCCL_TOPO_PATTERN_BALANCED_TREE;
@@ -895,6 +900,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   // AllGather3 - begin
   NCCLCHECKGOTO(ncclCalloc(&allGather3Data, nranks), ret, fail);
 
+  // 对每个 NCCL algorithm 设置 ncclTopoCompute 的结果，之后需要对不同 rank 计算的信息汇总
   for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
     allGather3Data[rank].graphInfo[a].pattern = graphs[a]->pattern;
     allGather3Data[rank].graphInfo[a].nChannels = graphs[a]->nChannels;
@@ -910,8 +916,15 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   allGather3Data[rank].cpuVendor = comm->cpuVendor;
 
   comm->nChannels = std::min(treeGraph->nChannels, ringGraph->nChannels);
+  // 然后开始设置ncclTopoRanks，获取当前rank在ring中的prev和next，
+  // 假设两机十六卡的情况下第一台机器的一个ring为：
+  // graph->intra: GPU/0 GPU/7 GPU/6 GPU/3 GPU/2 GPU/5 GPU/4 GPU/1
+  // 其中第一个rank的prev和最后一个rank的next为-1，如rank6的prev为7，next为3；
+  // 获取当前ring的ringRecv和ringSend，即ring的第一个节点和最后一个节点，最后将搜索到的环复制了一遍，
+  // 这里在官方issue中看到相关解释是为了进一步的并行以充分利用带宽。
   NCCLCHECKGOTO(ncclTopoPreset(comm, graphs, &allGather3Data[rank].topoRanks), ret, fail);
 
+  // AllGather 所有 rank 信息，这样每个 rank 都能拿到全局的信息了
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allGather3Data, sizeof(*allGather3Data)), ret, fail);
 
   // Determine nNodes, firstRanks, ...
@@ -1045,6 +1058,13 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   NCCLCHECKGOTO(computeBuffSizes(comm), ret, fail);
 
+  // 接下来调用ncclTopoComputeP2pChannels获取P2P Channel的数量。所谓P2P Channel就是只两个rank之间的点对点通信channel。
+
+  // 之前在建立ringGraph的时候有搜索出一系列的环，并根据这些环建立了channel，
+  // 假设现在一共有nChannels个channel，而p2p需要p2pnChannels个channel，
+  // 那么如果p2pnChannels大于nChannles，会再创建p2pnChannels - nChannels个channel，
+  // 并进行初始化，其他的复用；否则直接复用即可。对于每个send/recv操作，
+  // 会使用p2pnChannelsPerPeer个channel并行发送/接收。
   // Compute nChannels per peer for p2p
   NCCLCHECKGOTO(ncclTopoComputeP2pChannels(comm), ret, fail);
 
@@ -1065,15 +1085,28 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
   comm->topParentLocalRanks = topParentLocalRanks;
 
+  // 具体线程处理函数为ncclProxyService，当然如果支持UDS的话还会创建对应的UDS线程。
+  // 而proxy的监听端口和socket信息是在我们第二章讲bootstrap网络的时候创建的，
+  // 并采用 bootstrapAllGather 方法获取了所有进程(rank)的 proxy 监听端口和所有进程的 UDS 信息。
   NCCLCHECKGOTO(ncclTransportCheckP2pType(comm, &comm->intraNodeP2pSupport, &comm->directMode), ret, fail);
   // Launch proxy service thread, after this, the proxy calls can be used.
   if (parent && parent->config.splitShare) {
     comm->proxyState = parent->sharedRes->proxyState;
     ncclAtomicRefCountIncrement(&parent->sharedRes->proxyState->refCount);
   } else {
+    // NCCL为每个Rank创建一个proxyService线程，线程处理函数为：ncclProxyService，
+    // 每个Rank上的线程名字分别为：NCCL Service 0，NCCL Service 1，NCCL Service 2，NCCL Service 3（4 GPU）。
+    // NCCL为每个Rank创建一个proxyProgress线程，线程处理函数为：ncclProxyProgress，
+    // 线程名字一样，都为：NCCL Progress 4（4 GPU）
     NCCLCHECKGOTO(ncclProxyCreate(comm), ret, fail);
   }
   NCCLCHECKGOTO(ncclCalloc(&comm->gproxyConn, comm->nRanks), ret, fail);
+  // 在NCCL中，intra-node场景，GPU与GPU之间建立P2P transport，以及inter-node场景，
+  // 通过NET建立NET transport的时候，都需要proxy线程的参与，其实总共有两个proxy线程，
+  // 一个叫做proxyService线程，是每个NODE中每个GPU对应的一个，主要维护连接建立， 
+  // 用于transport的setup和connect阶段。另一个叫做proxyProgress线程，
+  // 也是每个NODE中每个GPU对应的一个，主要在inter-node通信过程中，处理kernel和IB之间的数据交互。
+  // 而我们这里提到的就是proxyService线程。
 
   timers[TIMER_INIT_CONNECT] = clockNano();
   do { // Build p2p schedule
@@ -1083,6 +1116,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     int local = comm->localRank;
     int nLocals = comm->maxLocalRanks;
     struct ncclNodeRanks* nodeRanks = comm->nodeRanks;
+    // 检查所有节点是否拥有相同数量的本地进程，如不相同则采用"扁平"模式，将所有节点视为一个节点处理。
     bool flat = false;
     for (int node = 0; node < nNodes; node++) {
       if (nodeRanks[node].localRanks != nLocals) {
@@ -1092,10 +1126,14 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
         break;
       }
     }
+    // 计算节点数和每节点本地进程数的最小2的幂，这有助于后面的算法实现。
     int nNodesPow2 = pow2Up(nNodes);
     int nLocalsPow2 = pow2Up(nLocals);
+    // 为P2P调度和通信规划器的对等点分配内存。
     comm->p2pSchedule = ncclMemoryStackAlloc<ncclComm::P2pSchedulePair>(&comm->memPermanent, nRanks);
     comm->planner.peers = ncclMemoryStackAlloc<ncclKernelPlanner::Peer>(&comm->memPermanent, nRanks);
+
+    // 初始化用于生成通信模式的变量：节点轮次、节点间距和总轮次。
     uint32_t nodeRound = 0;
     uint32_t nodeDelta = 0;
     int round = 0;
@@ -1103,6 +1141,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     // Since that formula only produces valid permutations when N is a pow of 2,
     // we let N = pow2Up(n) and filter out results greater-eq to n.
     // Example sequence for 16 ranks: 0, 1, 3, 6, 10, 15, 5, 12, 4, 13, 7, 2, 14, 11, 9, 8
+    // 开始节点内本地进程级别的循环，筛选有效的本地进程间距。
     do {
       if (nodeDelta < nNodes) { // Filter nonsensical node deltas
         int sendNode = (node + nodeDelta) % nNodes;
@@ -1111,12 +1150,15 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
         uint32_t localDelta = 0;
         do {
           if (localDelta < nLocals) { // Filter nonsensical node-local deltas
+            // 计算发送和接收本地进程的ID。
             int sendLocal = (local + localDelta) % nLocals;
             int recvLocal = (local - localDelta + nLocals) % nLocals;
+            // 根据模式（扁平或分层）设置P2P调度的发送和接收进程ID。
             comm->p2pSchedule[round].sendRank = flat ? sendLocal : nodeRanks[sendNode].localRankToRank[sendLocal];
             comm->p2pSchedule[round].recvRank = flat ? recvLocal : nodeRanks[recvNode].localRankToRank[recvLocal];
             round += 1;
           }
+          // 更新本地轮次和间距，使用二次函数公式并通过按位与操作确保结果在范围内。
           localRound += 1;
           localDelta = (localDelta + localRound) & (nLocalsPow2 - 1); // Quadratic update
         } while (localRound != nLocalsPow2);
@@ -1134,6 +1176,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   comm->runtimeConn = comm->cuMemSupport && ncclParamRuntimeConnect();
   if (comm->runtimeConn) {
+    // 运行时连接路径， 如果支持CUDA统一内存和运行时连接，则采用这种较简单的初始化路径
     for (int c=0; c<comm->nChannels; c++) {
       NCCLCHECKGOTO(setupChannel(comm, c, rank, nranks, rings+c*nranks), ret, fail);
     }
@@ -1142,11 +1185,19 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     // Check if we can setup CollNet
     if (comm->collNetSupport > 0) ncclCollNetSetup(comm, parent, graphs);
   } else {
+    // 传统连接路径，设置更复杂的连接拓扑，包括环形、树形、P2P等多种通信模式
     for (int c=0; c<comm->nChannels; c++) {
+      // 无论哪种模式，都需要初始化基本通道：
+      // 调用setupChannel设置通信 channel。
+      // 该函数主要计算当前进程在ring中的位置和rank=0进程在ring中位置的距离，
+      // 并赋值给ring->index。此外，setupChannel重新组织ring中的所有 ranks，
+      // 使得本进程的 rank 作为ring的起点，并把重组后的ring赋值给ring->userRanks。
       NCCLCHECKGOTO(setupChannel(comm, c, rank, nranks, rings+c*nranks), ret, fail);
     }
+    // 建立所有节点间的环形通信连接，每个节点连接到下一个节点。
     NCCLCHECKGOTO(ncclTransportRingConnect(comm), ret, fail);
 
+    // 建立树形通信拓扑，用于实现广播、归约等操作。
     // Connect Trees
     NCCLCHECKGOTO(ncclTransportTreeConnect(comm), ret, fail);
 
@@ -1342,6 +1393,8 @@ fail:
 
 static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_;
+
+  // 获取 job 中已分配好的 communicator
   ncclComm_t comm = job->comm;
   ncclResult_t res = ncclSuccess;
   int archMajor, archMinor;
@@ -1355,12 +1408,16 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   unsigned long long commIdHash;
 
   timers[TIMER_INIT_TOTAL] = clockNano();
+  // 设置CUDA设备为指定的设备ID  
   CUDACHECKGOTO(cudaSetDevice(cudaDev), res, fail);
   CUDACHECKGOTO(cudaDeviceGetAttribute(&maxSharedMem, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev), res, fail);
   CUDACHECKGOTO(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, cudaDev), res, fail);
   CUDACHECKGOTO(cudaDeviceGetAttribute(&archMinor, cudaDevAttrComputeCapabilityMinor, cudaDev), res, fail);
+  // 计算CUDA设备的架构值（例如，7.5对应750）  
   cudaArch = 100*archMajor + 10*archMinor;
 
+  // 如果 kernel 栈的最大大小大于0且允许设置栈大小，则设置CUDA设备的栈大小限制  
+  // 这可以避免在加载时重新配置CUDA内存（例如，NVSHMEM问题） 
   timers[TIMER_INIT_KERNELS] = clockNano();
   NCCLCHECK(ncclInitKernelsForDevice(cudaArch, maxSharedMem, &maxLocalSizeBytes));
   // Set the maximum kernel stack size of all kernels to avoid
@@ -1371,8 +1428,12 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   }
   timers[TIMER_INIT_KERNELS] = clockNano() - timers[TIMER_INIT_KERNELS];
 
+  /*2、是否有父通信器
+        a、有，从父通信器分裂出来子通信器，并初始化
+        b、无，直接为其分配内存，并初始化*/
   if (job->parent) {
     NCCLCHECKGOTO(ncclCalloc(&parentRanks, job->parent->nRanks), res, fail);
+    // 获取分裂信息，如新 rank、 当前 rank、 parent communicator的rank等
     NCCLCHECKGOTO(commGetSplitInfo(comm, job->parent, job->color, job->key, &job->nranks, &job->myrank, parentRanks), res, fail);
     // Negative color does not create a new comm object. We needed to take part in the allgather, but we're done now.
     if (job->color == NCCL_SPLIT_NOCOLOR) goto exit;
@@ -1388,6 +1449,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     INFO(NCCL_INIT, "%s comm %p rank %d nranks %d cudaDev %d nvmlDev %d busId %lx parent %p splitCount %d color %d key %d- Init START", job->funcName,
          comm, comm->rank, comm->nRanks, comm->cudaDev, comm->nvmlDev, comm->busId, job->parent, job->splitCount, job->color, job->key);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano();
+    // 初始化分裂后的通信器 
     NCCLCHECKGOTO(bootstrapSplit(comm->commHash, comm, job->parent, job->color, job->key, parentRanks), res, fail);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano() - timers[TIMER_INIT_BOOTSTRAP];
     // debug info, no commId was used
@@ -1401,12 +1463,16 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     INFO(NCCL_INIT, "%s comm %p rank %d nranks %d cudaDev %d nvmlDev %d busId %lx commId 0x%llx - Init START", job->funcName,
          comm, comm->rank, comm->nRanks, comm->cudaDev, comm->nvmlDev, comm->busId, commIdHash);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano();
+    // 初始化 communicator
     NCCLCHECKGOTO(bootstrapInit(job->nId, (struct ncclBootstrapHandle*)job->commId, comm), res, fail);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano() - timers[TIMER_INIT_BOOTSTRAP];
   }
   comm->cudaArch = cudaArch;
 
+  // 4、根据通信器的配置，初始化所有的传输层
   NCCLCHECKGOTO(initTransportsRank(comm, job->parent, timers), res, fail);
+  // 5、加载NCCL的调优插件
+  NCCLCHECKGOTO(ncclTunerPluginLoad(&comm->tuner), res, fail);  
   NCCLCHECKGOTO(ncclTunerPluginLoad(comm), res, fail);
   if (comm->tuner) {
     NCCLCHECK(comm->tuner->init(comm->nRanks, comm->nNodes, ncclDebugLog, &comm->tunerContext));

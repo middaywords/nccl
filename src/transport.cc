@@ -19,6 +19,8 @@ struct ncclTransport* ncclTransports[NTRANSPORTS+1] = {
   &profilerTransport // Not really used for transport, only to create proxy ops polling on profiler counters.
 };
 
+// 然后selectTransport会遍历NCCL库中所有的transport。我们当前版本定义了以下四种transport。
+// 我们后面主要以netTransport为例进行分析。
 template <int type>
 static ncclResult_t selectTransport(struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclConnect* connect, int channelId, int peer, int connIndex, int* transportType) {
   struct ncclPeerInfo* myInfo = comm->peerInfo+comm->rank;
@@ -29,6 +31,14 @@ static ncclResult_t selectTransport(struct ncclComm* comm, struct ncclTopoGraph*
     struct ncclTransport *transport = ncclTransports[t];
     struct ncclTransportComm* transportComm = type == 1 ? &transport->send : &transport->recv;
     int ret = 0;
+
+    // 首先尝试便利每种transport的canConnect，如果成功则使用这个transport的setup函数进行transport的设置。
+    // 所以优先级也是按照定义顺序决定的。例如机内intra的rank之前如果可以创建P2Ptransport，则不会去创建netTransport。
+
+    // 而transport的setup函数主要就是和自己的proxyService线程通信，通过proxyService线程为创建用于传送数据的transport通道做时代的准备，
+    // 以netTransport为例就是sendSetup和recvSetup，sendSetup和recvSetup具体就不再展开，其中会通过ncclProxyConnect连接proxyService，
+    // 并调用ncclProxyCallBlocking向proxyService发送对于命令，如ncclProxyMsgInit，ncclProxyMsgSetup等，
+    // 而proxyService收到命令后就会执行相应的函数。
     NCCLCHECK(transport->canConnect(&ret, comm, graph, myInfo, peerInfo));
     if (ret) {
       connector->transportComm = transportComm;
@@ -99,6 +109,9 @@ ncclResult_t ncclTransportCheckP2pType(struct ncclComm* comm, bool* intraNodeP2p
   return ncclSuccess;
 }
 
+// 我们知道ncclTransportP2pSetup这个函数首先就是在一个循环中对每个channel调用的，
+// 然后ncclTransportP2pSetup里面开始也有一个for循环，遍历每个rank的前后相邻的两个rank，
+// 根据之前设置的channel mask记录的什么情况下创建send transport以及什么情况下创建recv transport，创建几个transport，进行transport的创建。
 ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, int connIndex) {
   // Stream used during transport setup; need for P2P pre-connect + CUDA Graph
   ncclResult_t ret = ncclSuccess;
@@ -142,6 +155,9 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     int sendChannels = 0, recvChannels = 0;
     int type;
     TIME_START(0);
+    // 对每个 channel 进行遍历，创建对应的 transport， type为0表示recv，type为1比表示send。
+    // 然后selectTransport会遍历NCCL库中所有的transport。我们当前版本（v2.22.3-1）定义了以下四种transport。
+    // 我们后面主要以netTransport为例进行分析。
     for (int c=0; c<MAXCHANNELS; c++) {
       if (recvMask & (1UL<<c)) {
         NCCLCHECKGOTO(selectTransport<0>(comm, graph, recvData[p]+recvChannels++, c, recvPeer, connIndex, &type), ret, fail);
@@ -173,6 +189,8 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     }
     TIME_STOP(2);
 
+    // 如下逻辑，前面setup完成必要的transport设置，
+    // 如内存注册等，后面在收发两端就开始调用transport的connect函数。
     if (i-done == maxPeers || i == comm->nRanks-1) {
       // Loop until all channels with all ranks have been connected
       bool allChannelsConnected;
@@ -194,6 +212,7 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
               struct ncclConnector* conn = comm->channels[c].peers[sendPeer]->send + connIndex;
               // This connector hasn't completed connection yet
               if (conn->connected == 0) {
+                // 调用 transport的connect函数进行连接
                 NCCLCHECKGOTO(conn->transportComm->connect(comm, sendData[p] + sendDataOffset, 1, comm->rank, conn), ret, fail);
                 if (ret == ncclSuccess) {
                   conn->connected = 1;

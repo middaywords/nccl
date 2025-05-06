@@ -1318,6 +1318,9 @@ fail:
   goto exit;
 }
 
+// 如proxyService在收到ncclProxyMsgInit后会调用proxyConnInit函数。
+// 这个函数会判断当前transport如果定义了proxyProgress函数，则调用proxyProgressInit创建proxyProgress线程，
+// proxyProgress主要是在inter-node通信过程中，处理kernel和IB之间的数据交互用的。
 static ncclResult_t proxyProgressInit(struct ncclProxyState* proxyState) {
   struct ncclProxyProgressState* state = &proxyState->progressState;
   if (state->opsPool == NULL) {
@@ -1351,6 +1354,7 @@ static ncclResult_t proxyProgressInit(struct ncclProxyState* proxyState) {
 
     memcpy(state->opsPoolShmSuffix, shmPath+sizeof("/dev/shm/nccl-")-1, sizeof("XXXXXX")-1);
 
+    // 创建 proxy progress 线程
     // All ops structures are created, we can start the progress thread
     NCCLCHECK(ncclProxyProgressCreate(proxyState));
   }
@@ -1558,6 +1562,7 @@ enum {
   PROXY_ABORT = 2
 };
 
+// 一个叫做proxyService线程，是每个NODE中每个GPU对应的一个，主要维护连接建立， 用于transport的setup和connect阶段。
 void* ncclProxyService(void* _args) {
   struct ncclProxyState* proxyState =  (struct ncclProxyState*) _args;
   // if (CPU_COUNT(&comm->cpuAffinity)) sched_setaffinity(0, sizeof(cpu_set_t), &comm->cpuAffinity);
@@ -1649,6 +1654,8 @@ void* ncclProxyService(void* _args) {
         // Coverity gets confused here by complex code structure.  Yes, connectionPool.pools gets dereferenced, and
         // while calling proxyProgressAsync() connectionPool.pools is NULL, but that changes before it's dereferenced.
         // coverity[var_deref_model:FALSE]
+        // 叫做proxyProgress线程，也是每个NODE中每个GPU对应的一个，主要在inter-node通信过程中，处理kernel和IB之间的数据交互。
+        // 而我们这里提到的就是proxyService线程。
         res = proxyProgressAsync(op, proxyState, &asyncOpCount, peer, &connectionPool);
         if (res == ncclSuccess || res == ncclInProgress) {
           op = opnext;
