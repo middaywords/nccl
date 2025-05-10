@@ -74,6 +74,7 @@ void* ncclAsyncJobMain(void* arg) {
   if (job->result != ncclSuccess) {
     INFO(NCCL_INIT,"%s:%d -> %d [Async thread]", __FILE__, __LINE__, job->result);
   }
+  // 完成后，设置状态为完成
   __atomic_store_n(&job->state, ncclGroupJobDone, __ATOMIC_RELEASE);
   return arg;
 }
@@ -191,7 +192,14 @@ fail:
   goto exit;
 }
 
+// 这段代码是 NVIDIA 集体通信库 (NCCL) 的核心组件，负责协调和启动 GPU 间的通信操作
+// 将通信对象组织成"集团"(clique)，每个集团内的对象共享相同的 intraComm0 值
+// 为每个集团（clique）准备和启动通信内核
+// 管理 CUDA 图捕获和同步屏障
 static ncclResult_t doLaunches(struct ncclComm* head) {
+  /*
+  集团(clieque)是具有相同 intraComm0 值的通信对象组
+  */
   ncclResult_t result = ncclSuccess;
   struct ncclComm* cliqueHead = head;
   struct ncclComm* cliqueNextHead;
@@ -202,6 +210,7 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
   do {
     struct ncclComm* comm = cliqueHead;
     bool capturingYes = false, capturingNo = false;
+    // 代码首先遍历每个通信对象，根据 intraComm0 值将它们分组
     do {
       (ncclCudaGraphValid(comm->planner.capturingGraph) ? capturingYes : capturingNo) = true;
       CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
@@ -234,10 +243,12 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
         if (moreRounds) {
           // Pop next unlaunched kernel
           struct ncclKernelPlan* plan = comm->planner.unlaunchedPlansHead;
+          // 执行 kernel
           if (plan != nullptr) {
             comm->planner.unlaunchedPlansHead = plan->next;
             CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
             NCCLCHECKGOTO(ncclLaunchKernelBefore_NoUncapturedCuda(comm, plan), result, failure);
+            // https://github.com/NVIDIA/nccl/issues/1300
             NCCLCHECKGOTO(ncclLaunchKernel(comm, plan), result, failure);
           }
           // Barrier reduction input indicates if we require further rounds.
@@ -399,7 +410,9 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
 
   bool *groupAbortFlag = gjob->abortFlagPtr;
 
+  // 处理预连接（P2P Preconnect）任务
   if (!simInfo && groupCommPreconnectHeadMain != nullptr) {
+    // 为每个预连接通信器创建并入队一个预连接任务
     struct ncclComm* comm = groupCommPreconnectHeadMain;
     do {
       struct ncclPreconnectJob* job;
@@ -419,8 +432,10 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
     } while (comm != nullptr);
   }
 
+  // 启动异步任务
   NCCLCHECKGOTO(asyncJobLaunch(asyncJobsMain, groupAbortFlag), ret, fail);
 
+  // 为集体通信建立连接
   /* Connect channels at runtime if cumem is supported */
   if (groupCommHeadMain != nullptr) {
     struct ncclComm* cliqueHead = groupCommHeadMain;
@@ -450,6 +465,10 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
           job->base.abortFlag = comm->abortFlag;
           job->base.abortFlagDev = comm->abortFlagDev;
           job->comm = comm;
+          // intraComm0 表示一个小派系，一个 process 有几个 comm？
+          // leader of intra-process comms (self possible)
+          // 这部分按照集群（有相同 intraComm0 值的通信器）组织通信器
+          // 检查各个通信器是否需要连接，为需要连接的通信器创建并执行连接任务。
           NCCLCHECKGOTO(ncclCalloc(&job->algoNeedConnect, NCCL_NUM_ALGORITHMS), ret, fail);
           memcpy(job->algoNeedConnect, algoNeedConnect, sizeof(bool) * NCCL_NUM_ALGORITHMS);
           ncclIntruQueueEnqueue(&asyncCollJobs, &job->base);
@@ -465,6 +484,7 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
       cliqueHead = comm;
     } while (cliqueHead != nullptr);
 
+    // 注册和入队集体通信任务
     // done with all buffer allocation, start registration and enqueue
     comm = groupCommHeadMain;
     do {
@@ -474,10 +494,13 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
     } while (comm);
   }
 
+  // 如果不是模拟模式并且有通信器，则启动通信内核。
   if ((!simInfo) && (groupCommHeadMain != nullptr)) {
+    // doLaunches 即启动通信内核
     NCCLCHECKGOTO(doLaunches(groupCommHeadMain), ret, fail);
   }
 
+  // 清理异步任务
   while (!ncclIntruQueueEmpty(asyncJobsMain)) {
     struct ncclAsyncJob* job = ncclIntruQueueDequeue(asyncJobsMain);
     if (!job->destroyFlag && job->comm && !job->comm->config.blocking)
@@ -485,6 +508,7 @@ static ncclResult_t groupLaunch(struct ncclAsyncJob *job_, ncclSimInfo_t* simInf
     if (job->destructor) job->destructor((void*)job);
   }
 
+  // 清理所有通信器，轮询回调（通常用于释放资源），让通信器离开组，设置错误状态。
   while (groupCommHeadMain != nullptr) {
     struct ncclComm* comm = groupCommHeadMain;
     struct ncclComm* next = comm->groupNext;
@@ -509,6 +533,7 @@ static ncclResult_t groupLaunchNonBlocking(struct ncclAsyncJob *job_) {
   return groupLaunch(job_ /* estimatedTime = NULL */);
 }
 
+// 这个函数实现了 NCCL（NVIDIA Collective Communications Library）中组通信操作的结束处理。
 ncclResult_t ncclGroupEndInternal(ncclSimInfo_t* simInfo) {
   ncclResult_t ret = ncclSuccess;
   ncclSimInfo_t internalSimInfo = NCCL_SIM_INFO_INITIALIZER;
@@ -517,6 +542,8 @@ ncclResult_t ncclGroupEndInternal(ncclSimInfo_t* simInfo) {
 
   internalSimInfo.magic = 0;
 
+  // 首先检查是否在组调用中，若不是则返回错误
+  // 减少组深度计数器，如果嵌套的组调用还没有全部结束（深度>0），直接退出
   if (ncclGroupDepth == 0) {
     WARN("ncclGroupEnd: not in a group call.");
     ret = ncclInvalidUsage;
@@ -527,6 +554,9 @@ ncclResult_t ncclGroupEndInternal(ncclSimInfo_t* simInfo) {
 
   if ((ret = ncclGroupError) != ncclSuccess) goto fail;
 
+  // 复制并验证模拟信息大小
+  // 检查魔数（magic number）确保初始化正确
+  // 设置内部使用的模拟信息指针
   if (simInfo) {
     memcpy((void*)&realSize, (void*)&simInfo->size, sizeof(size_t));
     realSize = realSize > sizeof(ncclSimInfo_t) ? sizeof(ncclSimInfo_t) : realSize;
@@ -539,6 +569,10 @@ ncclResult_t ncclGroupEndInternal(ncclSimInfo_t* simInfo) {
     internalSimInfoPtr = &internalSimInfo;
   }
 
+  // 如果有需要执行的通信操作（存在通信头或异步任务或预连接头）：
+  // 设置组任务主结构，包括各种头指针和状态指针
+  // 根据ncclGroupBlocking决定阻塞或非阻塞执行
+  // 这里的 ncclGroupHead 之前，在 taskAppend 中已经通过 ncclGroupCommJoin 设置过了
   if (ncclGroupCommHead != nullptr || !ncclIntruQueueEmpty(&ncclAsyncJobs) || ncclGroupCommPreconnectHead != nullptr) {
     ncclGroupJobMain.groupCommHeadPtr = &ncclGroupCommHead;
     ncclGroupJobMain.groupCommPreconnectHeadPtr = &ncclGroupCommPreconnectHead;
@@ -551,7 +585,13 @@ ncclResult_t ncclGroupEndInternal(ncclSimInfo_t* simInfo) {
     /* make sure ncclGroupBlocking has been set. */
     assert(ncclGroupBlocking == 0 || ncclGroupBlocking == 1);
     if (ncclGroupBlocking == 0) {
+      // 如果是非阻塞模式：
+      // 设置所有任务和通信的状态为ncclInProgress
+      // 创建新线程执行任务
+      // 返回ncclInProgress状态
       /* nonblocking group */
+      
+      // ncclAsyncJobs 代表的是 ncclCommInitRankDev 的时候初始化的一些任务
       if (!ncclIntruQueueEmpty(&ncclAsyncJobs)) {
         ncclAsyncJob* job = ncclIntruQueueHead(&ncclAsyncJobs);
         do {
@@ -561,6 +601,7 @@ ncclResult_t ncclGroupEndInternal(ncclSimInfo_t* simInfo) {
         } while (job);
       }
 
+      // ncclGroupCommHead 代表的是比如 ncclSend 之类的任务，通过 ncclGroupCommJoin 添加的
       if (ncclGroupCommHead) {
         ncclComm_t comm = ncclGroupCommHead;
         do {
@@ -575,6 +616,12 @@ ncclResult_t ncclGroupEndInternal(ncclSimInfo_t* simInfo) {
       PTHREADCHECKGOTO(pthread_create(&ncclGroupJobMainPtr->base.thread, NULL, ncclAsyncJobMain, (void*)&ncclGroupJobMainPtr->base), "pthread_create", ret, fail);
       ret = ncclInProgress;
     } else {
+      // 如果是阻塞模式：
+      // 保存当前CUDA设备
+      // 调用groupLaunch同步执行任务
+      // 恢复CUDA设备
+      // 复制回模拟信息
+      // 重置任务状态
       /* blocking group */
       int savedDev;
       CUDACHECKGOTO(cudaGetDevice(&savedDev), ret, fail);

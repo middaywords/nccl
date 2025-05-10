@@ -154,6 +154,8 @@ ncclResult_t ncclSend(const void* sendbuff, size_t count, ncclDataType_t datatyp
   NVTX3_FUNC_WITH_PARAMS(Send, NcclNvtxParamsSendRecv,
     NVTX3_PAYLOAD(comm ? comm->commHash : 0, count * ncclTypeSize(datatype), peer));
 
+  // 生成 ncclInfo，将 info enqueue 到队列中
+  // 这里的 info 是一个结构体，包含了buf数据，对端 id 等。
   struct ncclInfo info = { ncclFuncSend, "Send",
     NULL, (void*)sendbuff, count, datatype, ncclSum, peer, comm, stream, /* Args */
     1, 1 };

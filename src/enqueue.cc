@@ -1477,7 +1477,12 @@ ncclResult_t ncclLaunchKernelBefore_NoUncapturedCuda(struct ncclComm* comm, stru
 NCCL_PARAM(MemSyncDomain, "MEM_SYNC_DOMAIN", cudaLaunchMemSyncDomainRemote);
 #endif
 
+// https://github.com/NVIDIA/nccl/issues/1300
+// 该函数负责将 NCCL 通信操作转换为 CUDA 内核调用，根据不同的 CUDA 版本和 GPU 架构采用不同的内核启动策略。
 ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan) {
+  // 根据 plan->channelMask 计算需要使用的通信通道数量
+  // 设置 grid 和 block 维度（线程块结构）
+  // 设置共享内存大小和启动流
   ncclResult_t ret = ncclSuccess;
   struct ncclKernelPlanner* planner = &comm->planner;
   int nChannels = countOneBits(plan->channelMask);
@@ -1485,6 +1490,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   dim3 grid = {(unsigned)nChannels, 1, 1};
   dim3 block = {(unsigned)plan->threadPerBlock, 1, 1};
   int smem = ncclShmemDynamicSize(comm->cudaArch);
+  // 这里设置的 stream size 和位置
   cudaStream_t launchStream = planner->streams->stream;
   void* extra[] = {
     CU_LAUNCH_PARAM_BUFFER_POINTER, plan->kernelArgs,
@@ -1492,6 +1498,8 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     CU_LAUNCH_PARAM_END
   };
 
+  // 检查 CUDA 驱动程序版本
+  // 根据 CUDA 功能的可用性选择不同的内核启动方式
   int driverVersion;
   NCCLCHECKGOTO(ncclCudaDriverVersion(&driverVersion), ret, do_return);
 
@@ -1506,6 +1514,13 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     CUlaunchConfig launchConfig = {0};
     CUlaunchAttribute launchAttrs[4] = {};
     int attrs = 0;
+    // 现代方式（CUDA 11.8+）：使用 cuLaunchKernelEx，支持更多高级特性
+    // 线程块集群 (Thread Block Clusters)：适用于 sm90+ 架构
+    // 内存同步域设置：CUDA 12.0+ 的优化
+    // 启动完成事件：CUDA 12.3+ 的隐式排序支持
+    // 这是在 Hopper 架构 (sm90+) 引入的新特性
+    // 允许多个线程块在多个 SM 上同步协作
+    // 保证集群中的线程块会被同时调度到一组 SM 上
     /* Cooperative Group Array (CGA)
      * On sm90 and later we have an extra level of hierarchy where we
      * can group together several blocks within the Grid, called
@@ -1556,6 +1571,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     CUCHECKGOTO(cuLaunchKernelEx(&launchConfig, fn, nullptr, extra), ret, do_return);
   #endif
   } else {
+    // 对于较旧的 CUDA 版本，使用 cuLaunchKernel
     // Standard kernel launch
     CUCHECKGOTO(cuLaunchKernel(fn, grid.x, grid.y, grid.z, block.x, block.y, block.z, smem, launchStream, nullptr, extra), ret, do_return);
   }
@@ -2139,20 +2155,31 @@ static ncclResult_t hostToDevRedOp(
   return ncclSuccess;
 }
 
+// 负责将通信操作（communication operation）转换为任务并添加到通信器（communicator）的计划器中。
+// 该函数是 NCCL（NVIDIA Collective Communications Library）的一部分，用于处理 GPU 之间的通信任务
 // Converts `info` to a task and adds it to `comm->planner`. The exception is with
 // single rank communicators, collectives are issued as `ncclMemcpyAsync`s and
 // thus don't need a task.
 static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
   struct ncclKernelPlanner *planner = &comm->planner;
 
+  // 函数主要处理两种类型的操作：
+  // 1. 点对点通信（P2P）：包括 ncclFuncSend 和 ncclFuncRecv
+  // 2. 集体通信（Collective）：包括其他的 NCCL 函数，如 ncclFuncAllReduce、ncclFuncBroadcast 等
   if (info->coll == ncclFuncSend || info->coll == ncclFuncRecv) {
+    // 计算通信量大小（字节数）
     int peer = info->root;
     ssize_t nBytes = info->count*ncclTypeSize(info->datatype);
     bool isSendNotRecv = info->coll == ncclFuncSend;
 
     // Must be in thread local group before tasks can be alloc'd in `comm->memScoped`.
+    // 调用 ncclGroupCommJoin 确保当前通信器加入线程本地组
+    // 这里将通信器加入到线程本地组中，以便后续的任务可以在该组中进行分配和执行
+    // 后面的执行在 ncclGroupEndInternal 中完成，会检查 ncclGroupCommHead
     ncclGroupCommJoin(info->comm);
+    // 从内存池分配 ncclTaskP2p 结构体
     struct ncclTaskP2p* p2p = ncclMemoryPoolAlloc<struct ncclTaskP2p>(&comm->memPool_ncclTaskP2p, &comm->memPermanent);
+    // 设置 P2P 任务的各种属性（函数类型、缓冲区、数据类型等）
     p2p->func = info->coll;
     p2p->buff = (void*)info->recvbuff;
     p2p->count = info->count;
@@ -2160,23 +2187,28 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
     p2p->root = info->root;
     p2p->bytes = nBytes;
     p2p->eActivationMask = __atomic_load_n(&ncclProfilerEventMask, __ATOMIC_RELAXED);
+    // 根据操作类型将任务加入发送队列或接收队列
     ncclIntruQueueEnqueue(
       isSendNotRecv ? &planner->peers[peer].sendQueue : &planner->peers[peer].recvQueue,
       p2p);
+    // 更新 P2P 任务计数器
     planner->nTasksP2p += 1;
 
+    // 如果需要，标记需要预连接的通道：
     // Mark channels that need pre-connect
     if (comm->rank != peer) {
       if (!(isSendNotRecv ? planner->peers[peer].sendSeen : planner->peers[peer].recvSeen)) {
         // planner->peers[peer].send/recvSeen is private to each comm, so we need to set it anyway.
         (isSendNotRecv ? planner->peers[peer].sendSeen : planner->peers[peer].recvSeen) = true;
         int round = 0;
+        // 确定通信轮次（round）
         while (peer != (isSendNotRecv ? comm->p2pSchedule[round].sendRank
                                       : comm->p2pSchedule[round].recvRank)) {
           round += 1;
         }
         uint8_t base = ncclP2pChannelBaseForRound(comm, round);
         for (int c=0; c < comm->p2pnChannelsPerPeer; c++) {
+          // 计算通道基址和通道 ID
           int channelId = ncclP2pChannelForPart(comm->p2pnChannels, base, c);
           if (isSendNotRecv) {
             if (comm->channels[channelId].peers[peer]->send[1].hasSeen == 0) { // P2P uses only 1 connector
@@ -2185,6 +2217,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
               // shared comms together.
               comm->channels[channelId].peers[peer]->send[1].hasSeen = 1;
               comm->connectSend[peer] |= (1UL<<channelId);
+              // 设置相应通道的连接标志
               ncclGroupCommPreconnect(comm);
             }
           } else {
@@ -2198,9 +2231,11 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       }
     }
   } else {
+    // 当操作不是 P2P 通信时：
     // Empty collectives can be discarded.
     if (info->count == 0) return ncclSuccess;
 
+    // 检查 FP8 数据类型的支持（需要 sm90 或更高能力的设备）
     if (info->datatype == ncclFloat8e4m3 || info->datatype == ncclFloat8e5m2) {
       if (comm->minCompCap < 90) {
         WARN("FP8 reduction support begins with sm90 capable devices.");
@@ -2208,18 +2243,24 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       }
     }
 
+    // 将主机端的归约操作状态复制到设备端结构体
     // Copy reduction op state from op handle into info struct here since the
     // op handle may be destroyed before ncclGroupEnd().
     struct ncclDevRedOpFull opDev;
     NCCLCHECK(hostToDevRedOp(&opDev, info->op, info->datatype, comm));
 
+    // 单节点特殊处理：直接调用 ncclLaunchOneRank 函数
     if (comm->nRanks == 1) {
       NCCLCHECK(ncclLaunchOneRank(info->recvbuff, info->sendbuff, info->count, opDev, info->datatype, info->stream));
       return ncclSuccess;
     } else {
+      // 多节点处理：
+      // 调用 ncclGroupCommJoin 确保当前通信器加入线程本地组
       // Must be in thread local group before tasks can be alloc'd in `comm->memScoped`.
       ncclGroupCommJoin(info->comm);
+      // 分配 ncclTaskColl 结构体
       struct ncclTaskColl* t = ncclMemoryPoolAlloc<struct ncclTaskColl>(&comm->memPool_ncclTaskColl, &comm->memPermanent);
+      // 设置集体通信任务的各种属性
       t->func = info->coll;
       t->sendbuff = info->sendbuff;
       t->recvbuff = info->recvbuff;
@@ -2240,10 +2281,13 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       t->eActivationMask = __atomic_load_n(&ncclProfilerEventMask, __ATOMIC_RELAXED);
 
       planner->nTasksColl += 1;
+      // 根据流量大小将任务插入排序器中
       ncclTaskCollSorterInsert(&planner->collSorter, t, t->trafficBytes);
     }
   }
 
+  // 最后部分负责管理 CUDA 流：
+  // 检查当前操作的流是否与最近使用的流不同
   if (info->stream != planner->streamRecent || planner->streams == nullptr) {
     planner->streamRecent = info->stream;
     struct ncclCudaStreamList* l = planner->streams;
@@ -2252,10 +2296,12 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
         struct ncclCudaGraph graph;
         NCCLCHECK(ncclCudaGetCapturingGraph(&graph, info->stream));
         if (planner->streams != nullptr && !ncclCudaGraphSame(planner->capturingGraph, graph)) {
+          // 确保在同一组中的所有流要么都不在 CUDA 图捕获状态，要么都由同一个图捕获
           WARN("Streams given to a communicator within a NCCL group must either be all uncaptured or all captured by the same graph.");
           return ncclInvalidUsage;
         }
         planner->capturingGraph = graph; // C++ struct assignment
+        // 如果是新流，将其添加到流列表中
         // Add stream to list
         l = ncclMemoryStackAlloc<struct ncclCudaStreamList>(&comm->memScoped);
         l->stream = info->stream;
@@ -2272,6 +2318,9 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
 }
 
 ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
+  // ncclGroupStart只是对ncclGroupMode加一，ncclGroupMode非0表示处于Group操作中，
+  // GroupStart和GroupEnd间的操作不会阻塞，最后通过GroupEnd一次性提交操作。
+  // 在后面的版本，这个 ncclGroupMode 改成了 ncclGroupDepth
   NCCLCHECK(ncclGroupStartInternal());
   ncclResult_t ret = ncclSuccess;
   int devOld = -1;
@@ -2296,6 +2345,7 @@ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
 exit:
   if (devOld != -1) CUDACHECK(cudaSetDevice(devOld));
   ncclGroupErrCheck(ret);
+  // GroupEnd一次性提交操作。
   NCCLCHECK(ncclGroupEndInternal());
   /* if depth is 1, ncclGroupEndInternal() will trigger group ops. The state can change
    * so we have to check state here. */
